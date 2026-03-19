@@ -1,0 +1,279 @@
+---
+title: "Ask Wikipedia (Powered by LLM)"
+format: html
+server: shiny
+---
+
+
+```{r}
+install.packages("shiny", "httr", "openai")
+```
+```{r}
+library(shiny)
+library(httr)
+library(openai)
+
+# -------------------------------------------------------
+# Load API Key
+# -------------------------------------------------------
+key_path <- "openai_key.txt"
+if (file.exists(key_path)) {
+  openai_key <- readLines(key_path, warn = FALSE)
+  Sys.setenv(OPENAI_API_KEY = openai_key)
+  print("Loaded OpenAI API key from file.")
+} else {
+  openai_key <- Sys.getenv("OPENAI_API_KEY")
+  print("Loaded OpenAI API from system variable.")
+}
+
+if (openai_key == "") {
+  stop("OpenAI API key not found. Please set it in 'openai_key.txt' or as an environment variable 'OPENAI_API_KEY'.")
+}
+# -------------------------------------------------------
+# Rewrite query using LLM for better Wikipedia search
+# -------------------------------------------------------
+rewrite_query <- function(question) {
+  response <- create_chat_completion(
+    model = "gpt-4.1-mini",
+    messages = list(
+      list(
+        role = "system",
+        content = "Rewrite the user's question as a short, clean keyword-style query for Wikipedia. Return ONLY the query."
+      ),
+      list(role = "user", content = question)
+    )
+  )
+
+  query <- response$choices[1, "message.content"]
+  query <- gsub("[^a-zA-Z0-9 \\-]", "", query)
+  query <- trimws(query)
+
+  cat("=== DEBUG: rewritten query ===\n")
+  print(query)
+
+  return(query)
+}
+
+# -------------------------------------------------------
+# Fetch raw wikitext from Wikipedia using MediaWiki API
+# -------------------------------------------------------
+fetch_wikitext <- function(title) {
+  url <- "https://en.wikipedia.org/w/api.php"
+
+  res <- httr::GET(
+    url,
+    query = list(
+      action = "query",
+      prop = "revisions",
+      titles = title,
+      rvprop = "content",
+      rvslots = "main",
+      format = "json"
+    )
+  )
+
+  json <- httr::content(res, "parsed")
+  page <- json$query$pages[[1]]
+
+  text <- page$revisions[[1]]$slots$main$`*`
+
+  return(text)
+}
+
+# -------------------------------------------------------
+# Search Wikipedia + fetch wikitext for each result
+# -------------------------------------------------------
+fetch_wikipedia <- function(query, limit = 5) {
+  cat("=== DEBUG: starting wikipedia search ===\n")
+
+  url <- "https://en.wikipedia.org/w/api.php"
+  res <- httr::GET(
+    url,
+    query = list(
+      action = "query",
+      list = "search",
+      srsearch = query,
+      srlimit = limit,
+      format = "json"
+    )
+  )
+
+  json <- httr::content(res, "parsed")
+
+  cat("=== DEBUG: raw search response ===\n")
+  print(json$query$search)
+
+  titles <- sapply(json$query$search, function(x) x$title)
+
+  cat("=== DEBUG: search result titles ===\n")
+  print(titles)
+
+  pages <- lapply(titles, function(title) {
+    wt <- fetch_wikitext(title)
+    if (is.null(wt)) {
+      wt <- ""
+    }
+
+    list(
+      title = title,
+      url = paste0("https://en.wikipedia.org/wiki/", gsub(" ", "_", title)),
+      text = wt
+    )
+  })
+
+  cat("=== DEBUG: wikitext character lengths ===\n")
+  print(sapply(pages, function(p) nchar(p$text)))
+
+  return(pages)
+}
+
+# -------------------------------------------------------
+# LLM Summarization
+# -------------------------------------------------------
+summarize_with_llm <- function(question, pages) {
+  retrieved_text <- paste(
+    sapply(pages, function(p) {
+      paste0(
+        "### ",
+        p$title,
+        "\n",
+        substr(p$text, 1, 1200),
+        "...\n"
+      )
+    }),
+    collapse = "\n\n"
+  )
+
+  prompt <- paste0(
+    "You are assisting a user by answering their question using ONLY the Wikipedia excerpts provided.\n\n",
+    "User question: ",
+    question,
+    "\n\n",
+    "Wikipedia excerpts:\n\n",
+    retrieved_text,
+    "\n\n",
+    "Using ALL of the provided Wikipedia excerpts, write a single unified answer.\n",
+    "Synthesize the information across all pages.\n",
+    "Do NOT list separate excerpts.\n\n",
+    "At the end, include a Citations section using ONLY the pages provided.\n",
+    "Format each line as:\n",
+    "- TITLE — URL\n"
+  )
+
+  cat("=== DEBUG: prompt sent to LLM ===\n")
+  cat(prompt, "\n\n")
+
+  response <- create_chat_completion(
+    model = "gpt-4.1",
+    messages = list(
+      list(
+        role = "system",
+        content = "You accurately summarize Wikipedia content."
+      ),
+      list(role = "user", content = prompt)
+    )
+  )
+
+  answer_raw <- response$choices[1, "message.content"]
+
+  cat("=== DEBUG: raw LLM output ===\n")
+  print(answer_raw)
+
+  return(answer_raw)
+}
+
+# -------------------------------------------------------
+# Extract citations
+# -------------------------------------------------------
+extract_citations <- function(answer_text) {
+  lines <- unlist(strsplit(answer_text, "\n"))
+  cite_lines <- grep("^\\- ", lines, value = TRUE)
+
+  citations <- lapply(cite_lines, function(line) {
+    parts <- unlist(strsplit(sub("^\\- ", "", line), " — "))
+    list(
+      title = parts[1],
+      url = parts[2]
+    )
+  })
+
+  return(citations)
+}
+
+# -------------------------------------------------------
+# Remove citations section before printing
+# -------------------------------------------------------
+clean_answer <- function(answer_text) {
+  lines <- unlist(strsplit(answer_text, "\n"))
+  idx <- grep("^Citations", lines)
+
+  if (length(idx) > 0) {
+    cleaned <- lines[1:(idx[1] - 1)]
+  } else {
+    cleaned <- lines
+  }
+
+  paste(cleaned, collapse = "\n")
+}
+
+# -------------------------------------------------------
+# UI
+# -------------------------------------------------------
+ui <- fluidPage(
+  tags$style(HTML(
+    "
+    .answer-box pre {
+      white-space: pre-wrap !important;
+      word-break: break-word !important;
+    }
+  "
+  )),
+
+  titlePanel("Ask Wikipedia (Powered by LLM)"),
+
+  textInput("question", "Enter a question:", width = "60%"),
+  actionButton("ask", "Ask"),
+  hr(),
+
+  h3("Answer"),
+  div(class = "answer-box", verbatimTextOutput("answer")),
+
+  h3("Citations"),
+  uiOutput("citations")
+)
+
+# -------------------------------------------------------
+# SERVER
+# -------------------------------------------------------
+server <- function(input, output, session) {
+  results <- eventReactive(input$ask, {
+    req(input$question)
+
+    query <- rewrite_query(input$question)
+    pages <- fetch_wikipedia(query)
+
+    answer_raw <- summarize_with_llm(input$question, pages)
+
+    answer_clean <- clean_answer(answer_raw)
+    citations <- extract_citations(answer_raw)
+
+    list(
+      answer = answer_clean,
+      citations = citations
+    )
+  })
+
+  output$answer <- renderText({
+    req(results())
+    results()$answer
+  })
+
+  output$citations <- renderUI({
+    req(results())
+    lapply(results()$citations, function(c) {
+      tags$div(tags$a(href = c$url, c$title, target = "_blank"))
+    })
+  })
+}
+
+shinyApp(ui, server)
