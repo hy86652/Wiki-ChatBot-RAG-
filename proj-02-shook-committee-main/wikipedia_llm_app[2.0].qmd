@@ -1,0 +1,405 @@
+---
+title: "Ask Wikipedia (Powered by LLM)"
+format: html
+server: shiny
+---
+
+
+```{r}
+install.packages("shiny", "httr", "openai")
+```
+```{r}
+library(shiny)
+library(httr)
+library(openai)
+library(shinycssloaders)
+
+# -------------------------------------------------------
+# Load API Key
+# -------------------------------------------------------
+key_path <- "openai_key.txt"
+if (file.exists(key_path)) {
+  openai_key <- readLines(key_path, warn = FALSE)
+  Sys.setenv(OPENAI_API_KEY = openai_key)
+  print("Loaded OpenAI API key from file.")
+} else {
+  openai_key <- Sys.getenv("OPENAI_API_KEY")
+  print("Loaded OpenAI API from system variable.")
+}
+if (openai_key == "") {
+  stop("OpenAI API key not found. Please set it in 'openai_key.txt' or as an environment variable 'OPENAI_API_KEY'.")
+}
+
+# -------------------------------------------------------
+# Rewrite query using LLM for better Wikipedia search
+# -------------------------------------------------------
+rewrite_query <- function(question) {
+  response <- create_chat_completion(
+    model = "gpt-4.1-mini",
+    messages = list(
+      list(
+        role = "system",
+        content = "Rewrite the user's question into a concise keyword or phrase suitable for Wikipedia search. Focus on the main subject (e.g., 'apple' from 'what is apple'). Return ONLY the keyword or phrase."
+      ),
+      list(role = "user", content = question)
+    )
+  )
+  query <- response$choices[1, "message.content"]
+  query <- gsub("[^a-zA-Z0-9 \\-]", "", query)
+  trimws(query)
+}
+
+# -------------------------------------------------------
+# Fetch raw wikitext
+# -------------------------------------------------------
+fetch_wikitext <- function(title) {
+  url <- "https://en.wikipedia.org/w/api.php"
+  res <- httr::GET(url,
+                   query = list(action="query", prop="revisions",
+                                titles=title, rvprop="content",
+                                rvslots="main", format="json"))
+  json <- httr::content(res, "parsed")
+  page <- json$query$pages[[1]]
+  page$revisions[[1]]$slots$main$`*`
+}
+
+# -------------------------------------------------------
+# Search Wikipedia
+# -------------------------------------------------------
+fetch_wikipedia <- function(query, limit=5) {
+  url <- "https://en.wikipedia.org/w/api.php"
+  res <- httr::GET(url,
+                   query = list(action="query", list="search",
+                                srsearch=query, srlimit=limit,
+                                format="json"))
+  json <- httr::content(res, "parsed")
+  titles <- sapply(json$query$search, function(x) x$title)
+  lapply(titles, function(title) {
+    wt <- fetch_wikitext(title)
+    if (is.null(wt)) wt <- ""
+    list(title=title,
+         url=paste0("https://en.wikipedia.org/wiki/", gsub(" ", "_", title)),
+         text=wt)
+  })
+}
+
+# -------------------------------------------------------
+# LLM Summarization
+# -------------------------------------------------------
+summarize_with_llm <- function(question, pages) {
+  retrieved_text <- paste(
+    sapply(pages, function(p) {
+      paste0("### ", p$title, "\n", substr(p$text, 1, 1200), "...\n")
+    }), collapse="\n\n")
+  prompt <- paste0(
+    "You are assisting a user by answering their question using ONLY the Wikipedia excerpts provided.\n\n",
+    "User question: ", question, "\n\n",
+    "Wikipedia excerpts:\n\n", retrieved_text, "\n\n",
+    "Using ALL of the provided Wikipedia excerpts, write a single unified answer.\n",
+    "Synthesize the information across all pages.\n",
+    "Do NOT list separate excerpts.\n\n",
+    "At the end, include a Citations section using ONLY the pages provided.\n",
+    "Format each line as:\n- TITLE — URL\n")
+  response <- create_chat_completion(
+    model="gpt-4.1",
+    messages=list(
+      list(role="system", content="You accurately summarize Wikipedia content."),
+      list(role="user", content=prompt)
+    )
+  )
+  response$choices[1, "message.content"]
+}
+
+# -------------------------------------------------------
+# Extract citations
+# -------------------------------------------------------
+extract_citations <- function(answer_text) {
+  lines <- unlist(strsplit(answer_text, "\n"))
+  cite_lines <- grep("^\\- ", lines, value=TRUE)
+  lapply(cite_lines, function(line) {
+    parts <- unlist(strsplit(sub("^\\- ", "", line), " — "))
+    list(title=parts[1], url=parts[2])
+  })
+}
+
+# -------------------------------------------------------
+# Remove citations section
+# -------------------------------------------------------
+clean_answer <- function(answer_text) {
+  lines <- unlist(strsplit(answer_text, "\n"))
+  idx <- grep("^Citations", lines)
+  if (length(idx)>0) lines <- lines[1:(idx[1]-1)]
+  paste(lines, collapse="\n")
+}
+
+# -------------------------------------------------------
+# In-text citation helper
+# -------------------------------------------------------
+add_intext_citations <- function(answer, citations) {
+  if (length(citations)==0) return(answer)
+  cited_answer <- answer
+  for (i in seq_along(citations)) {
+    pattern <- citations[[i]]$title
+    cited_answer <- gsub(pattern,
+                         paste0(pattern, " [", i, "]"),
+                         cited_answer, fixed=TRUE)
+  }
+  cited_answer
+}
+
+# -------------------------------------------------------
+# UI
+# -------------------------------------------------------
+ui <- fluidPage(
+  tags$head(
+    tags$style(HTML("
+      body {
+        font-family: 'Segoe UI', Arial, sans-serif;
+        background-image: url('https://www.transparenttextures.com/patterns/cubes.png');
+        background-color: #f0f4f8;
+        background-repeat: repeat;
+        background-attachment: fixed;
+        margin: 0;
+        padding: 0;
+      }
+      .info-banner {
+        background: linear-gradient(90deg, #6a11cb, #2575fc);
+        color: white;
+        padding: 18px;
+        border-radius: 12px;
+        margin-bottom: 30px;
+        text-align: center;
+        font-size: 22px;
+        font-weight: bold;
+        letter-spacing: 1px;
+        box-shadow: 0 0 12px rgba(106,17,203,0.3);
+      }
+      .card {
+        background: white;
+        padding: 25px;
+        margin-bottom: 25px;
+        border-radius: 12px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        transition: transform 0.2s ease, box-shadow 0.2s ease;
+      }
+      .card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 16px rgba(0,0,0,0.15);
+      }
+      .answer-box pre {
+        white-space: pre-wrap !important;
+        word-break: break-word !important;
+        font-size: 15px;
+        line-height: 1.5;
+      }
+      .subtitle {
+        color: #6b7280;
+        font-size: 16px;
+        font-style: italic;
+        margin-top: -5px;
+        text-align: center;
+      }
+      .btn-primary {
+        background-color: #2563eb;
+        border-color: #2563eb;
+        border-radius: 6px;
+        font-weight: 600;
+        transition: background-color 0.2s ease;
+      }
+      .btn-primary:hover {
+        background-color: #1e40af;
+        border-color: #1e40af;
+      }
+      .btn-default {
+        border-radius: 6px;
+        font-weight: 500;
+      }
+      .info-banner {
+        position: sticky;
+        top: 0;
+        z-index: 1000;
+      }
+      .subtitle {
+        color: #374151;
+        font-size: 15px;
+        font-style: italic;
+        margin-top: 8px;
+        margin-bottom: 12px;
+      }
+
+    ")),
+    # Enter triggers Ask
+    tags$script(HTML("
+      document.addEventListener('DOMContentLoaded', function() {
+        var input = document.getElementById('question');
+        var btn = document.getElementById('ask');
+        if (input && btn) {
+          input.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              btn.click();
+            }
+          });
+        }
+      });
+    ")),
+    tags$script(HTML("
+    document.addEventListener('DOMContentLoaded', function() {
+      var btn = document.getElementById('backToTop');
+      btn.addEventListener('click', function() {
+        window.scrollTo({top: 0, behavior: 'smooth'});
+        });
+      });
+    ")),
+
+    tags$style(HTML("
+      #backToTop {
+        position: fixed;
+        bottom: 30px;
+        right: 30px;
+        z-index: 9999;
+        background-color: #2563eb;
+        color: white;
+        border: none;
+        border-radius: 50%;
+        width: 50px;
+        height: 50px;
+        font-size: 20px;
+        cursor: pointer;
+        box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+      }
+      #backToTop:hover {
+        background-color: #1e40af;
+      }
+  "))
+
+  ),
+
+  # top title
+  fluidRow(
+    column(8, offset=2,
+      div(class="info-banner", "Info 5940 By Shook-Committee"),
+      h1("Ask Wikipedia (Powered by LLM)", align="center"),
+      div(class="subtitle", "Search, summarize, and cite Wikipedia content")
+    )
+  ),
+
+  # main boday content
+  fluidRow(
+    column(8, offset=2,
+      div(class="card",
+        h3("How to use this chat"),
+        p("1. Enter your question in the input box below."),
+        p("2. Press Ask or hit Enter."),
+        p("3. The system will search Wikipedia and generate a summarized answer with citations."),
+        p("4. Scroll down to view the answer, citations, and search history.")
+      ),
+      div(class="card",
+        textInput("question", "Enter a question:", width="100%"),
+        div(class="subtitle", textOutput("recent_keywords")),
+        fluidRow(
+          column(6, actionButton("ask", "Ask", class="btn btn-primary")),
+          column(6, align="right", downloadButton("download_citations", "Download citations", class="btn btn-default"))
+        )
+      ),
+      div(class="card",
+        h3("Answer"),
+        withSpinner(textOutput("answer"))
+      ),
+      div(class="card",
+        h3("Citations"),
+        withSpinner(uiOutput("citations"))
+      ),
+      div(class="card",
+        h3("Search History"),
+        uiOutput("history")
+      )
+    )
+  ),
+  tags$button(id="backToTop", "↑")
+
+)
+
+# -------------------------------------------------------
+# SERVER
+# -------------------------------------------------------
+server <- function(input, output, session) {
+  citations_state <- reactiveVal(NULL)
+  history_state <- reactiveVal(list())
+
+  results <- eventReactive(input$ask, {
+    req(input$question)
+    withProgress(message="Processing your query...", value=0, {
+      incProgress(0.2, detail="Rewriting query...")
+      query <- rewrite_query(input$question)
+      incProgress(0.5, detail="Fetching Wikipedia pages...")
+      pages <- fetch_wikipedia(query)
+      incProgress(0.8, detail="Summarizing with LLM...")
+      answer_raw <- summarize_with_llm(input$question, pages)
+      answer_clean <- clean_answer(answer_raw)
+      citations <- extract_citations(answer_raw)
+      citations_state(citations)
+      answer_with_cites <- add_intext_citations(answer_clean, citations)
+      # update history
+      old <- history_state()
+      new_entry <- list(question=input$question, answer=answer_with_cites)
+      history_state(c(c(list(new_entry), old)))
+      incProgress(1.0, detail="Done")
+      list(answer=answer_with_cites, citations=citations)
+    })
+  })
+
+  output$answer <- renderText({
+    req(results())
+    results()$answer
+  })
+
+  output$citations <- renderUI({
+    req(results())
+    lapply(seq_along(results()$citations), function(i) {
+      c <- results()$citations[[i]]
+      tags$div(paste0("[", i, "] "), tags$a(href = c$url, c$title, target = "_blank"))
+    })
+  })
+
+  output$recent_keywords <- renderText({
+    hist <- history_state()
+    if (length(hist) == 0) return("Recent queries: None yet.")
+    recent <- head(hist, 3)
+    paste("Recent queries:", paste(sapply(recent, function(h) h$question), collapse = " | "))
+  })
+
+  # download citations：output as txt file
+  output$download_citations <- downloadHandler(
+    filename = function() {
+      paste0("citations-", format(Sys.time(), "%Y%m%d-%H%M%S"), ".txt")
+    },
+    content = function(file) {
+      cites <- citations_state()
+      if (is.null(cites) || length(cites) == 0) {
+        writeLines("No citations available.", con = file)
+      } else {
+        lines <- vapply(seq_along(cites), function(i) {
+          paste0("[", i, "] ", cites[[i]]$title, " — ", cites[[i]]$url)
+        }, character(1))
+        writeLines(lines, con = file)
+      }
+    }
+  )
+
+  # Search History output
+  output$history <- renderUI({
+    hist <- history_state()
+    if (length(hist) == 0) return("No history yet.")
+    tagList(lapply(seq_along(hist), function(i) {
+      h <- hist[[i]]
+      tags$div(
+        tags$b(paste0(i, ". Q: ", h$question)),
+        tags$div(style="margin-left:10px; white-space:pre-wrap; word-break:break-word;", h$answer),
+        tags$hr()
+      )
+    }))
+  })
+}
+
+shinyApp(ui, server)
