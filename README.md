@@ -20,6 +20,6 @@ Run the quarto file: "wikipedia_llm_app.qmd"
 
 # To connect to the deployed app, visit:
 
-[Deployed App](https://019ae764-a793-59ee-0e7a-bba44f6653b4.share.connect.posit.cloud/)
+[[Deployed App](https://019ae764-a793-59ee-0e7a-bba44f6653b4.share.connect.posit.cloud/)
 
-[https://019ae764-a793-59ee-0e7a-bba44f6653b4.share.connect.posit.cloud/](https://019ae764-a793-59ee-0e7a-bba44f6653b4.share.connect.posit.cloud/)
+[https://019ae764-a793-59ee-0e7a-bba44f6653b4.share.connect.posit.cloud/](https://019ae764-a793-59ee-0e7a-bba44f6653b4.share.connect.posit.cloud/)](https://019b32a6-6f99-d80f-ffef-1cb3decc9655.share.connect.posit.cloud/)
